@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+.vscode/
+
+# Local generated viewer exports. Keep region snapshots under web/data/ tracked.
+/web/points_all.json
+/web/points_available.json
+/web/points_overlap.json
+/web/points.json
+/web/polygons.json
+
+# Keep customer-facing planning notes out of the public repo by default.
+/docs/customer_*.md

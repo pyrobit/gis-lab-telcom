@@ -1,0 +1,16 @@
+[project]
+name = "gis-lab"
+version = "0.1.0"
+description = "Synthetic telecom availability GIS lab using Python, PostGIS, and Leaflet."
+readme = "README.md"
+requires-python = ">=3.13"
+keywords = ["gis", "postgis", "geojson", "leaflet", "spatial-analysis"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "psycopg2-binary>=2.9.11",
+    "python-dotenv>=1.2.1",
+]

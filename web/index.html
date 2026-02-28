@@ -1,0 +1,425 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>GIS Lab Viewer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100vh; width: 100%; }
+    .hint {
+      position: absolute; z-index: 9999; top: 10px; left: 10px;
+      background: rgba(255,255,255,0.9); padding: 8px 10px; border-radius: 8px;
+      font-family: system-ui, sans-serif; font-size: 14px;
+    }
+    .hint-title { margin-bottom: 6px; font-weight: 600; }
+    .hint-controls { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+    .hint-controls select { font-size: 12px; padding: 2px 4px; }
+    .hint-meta { margin-top: 5px; font-size: 11px; color: #4b5563; }
+  </style>
+</head>
+<body>
+  <div class="hint">
+    <div class="hint-title">GIS Lab: polygons + points (Leaflet)</div>
+    <div class="hint-controls">
+      <label for="regionSelect">Region</label>
+      <select id="regionSelect"></select>
+    </div>
+    <div id="dataRootLabel" class="hint-meta"></div>
+  </div>
+  <div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+<script>
+  const map = L.map('map', { preferCanvas: true }).setView([39.5, -98.35], 4);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19
+  }).addTo(map);
+
+  const colors = {
+    "ProviderA": "#2b6cb0",
+    "ProviderB": "#c53030",
+    "Coverage": "#0f766e"
+  };
+
+  const layers = {
+    polygons: L.featureGroup(),
+    allPoints: L.layerGroup(),
+    available: L.layerGroup(),
+    overlaps: L.layerGroup()
+  };
+
+  const regionOptions = [
+    { id: "nyc", label: "New York City" },
+    { id: "rio", label: "Rio de Janeiro" }
+  ];
+  const defaultRegion = "nyc";
+  const urlParams = new URLSearchParams(window.location.search);
+  const requestedRegion = String(urlParams.get("region") || defaultRegion).toLowerCase();
+  const activeRegion = regionOptions.some(r => r.id === requestedRegion) ? requestedRegion : defaultRegion;
+  const activeRegionLabel = (regionOptions.find(r => r.id === activeRegion) || regionOptions[0]).label;
+
+  const regionSelect = document.getElementById("regionSelect");
+  const dataRootLabel = document.getElementById("dataRootLabel");
+  for (const region of regionOptions) {
+    const opt = document.createElement("option");
+    opt.value = region.id;
+    opt.textContent = region.label;
+    regionSelect.appendChild(opt);
+  }
+  regionSelect.value = activeRegion;
+  regionSelect.addEventListener("change", () => {
+    const next = new URLSearchParams(window.location.search);
+    next.set("region", regionSelect.value);
+    window.location.search = next.toString();
+  });
+
+  async function loadJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Failed to load ${url}`);
+    return r.json();
+  }
+
+  async function loadOptionalJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    return r.json();
+  }
+
+  function buildDataUrl(root, fileName) {
+    return root ? `${root}/${fileName}` : fileName;
+  }
+
+  async function loadBundleFromRoot(root) {
+    return Promise.all([
+      loadJSON(buildDataUrl(root, "points_all.json")),
+      loadJSON(buildDataUrl(root, "points_available.json")),
+      loadJSON(buildDataUrl(root, "points_overlap.json")),
+      loadOptionalJSON(buildDataUrl(root, "polygons.json"))
+    ]);
+  }
+
+  async function loadRegionBundle(regionId) {
+    const scopedRoot = `data/${regionId}`;
+    try {
+      const [allPoints, available, overlaps, polygons] = await loadBundleFromRoot(scopedRoot);
+      return { allPoints, available, overlaps, polygons, dataRoot: scopedRoot, legacyFallback: false };
+    } catch (scopedError) {
+      if (regionId === defaultRegion) {
+        try {
+          const [allPoints, available, overlaps, polygons] = await loadBundleFromRoot("");
+          return {
+            allPoints,
+            available,
+            overlaps,
+            polygons,
+            dataRoot: ".",
+            legacyFallback: true
+          };
+        } catch (_) {
+          // Keep original scoped error context.
+        }
+      }
+      throw new Error(
+        `Failed to load region '${regionId}' data from '${scopedRoot}'. ` +
+        `Generate files under '${scopedRoot}/' first.`
+      );
+    }
+  }
+
+  function downsampleFeatures(features, maxCount) {
+    if (!features || features.length <= maxCount) return features || [];
+    const step = Math.ceil(features.length / maxCount);
+    const sampled = [];
+    for (let i = 0; i < features.length; i += step) sampled.push(features[i]);
+    return sampled;
+  }
+
+  function targetCountByZoom(total, zoom, atZoom12, minCount, maxCount) {
+    if (!total) return 0;
+    const scaled = Math.round(atZoom12 * Math.pow(2, (zoom - 12) * 0.72));
+    const bounded = Math.max(minCount, Math.min(maxCount, scaled));
+    return Math.min(total, bounded);
+  }
+
+  function hash32(value) {
+    const text = String(value ?? "");
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+    }
+    return h >>> 0;
+  }
+
+  function jitterLatLng(latlng, key, maxMeters) {
+    const h = hash32(key);
+    const angle = ((h % 3600) / 3600) * Math.PI * 2;
+    const radiusMeters = maxMeters * (0.35 + (((h >>> 8) % 1000) / 1000) * 0.65);
+    const dLat = (Math.sin(angle) * radiusMeters) / 111320;
+    const cosLat = Math.cos((latlng.lat * Math.PI) / 180);
+    const dLon = (Math.cos(angle) * radiusMeters) / (111320 * Math.max(0.25, cosLat));
+    return L.latLng(latlng.lat + dLat, latlng.lng + dLon);
+  }
+
+  function buildDerivedPolygons(pointsFc) {
+    if (!pointsFc || !pointsFc.features || pointsFc.features.length < 3) return null;
+    if (typeof turf === "undefined") return null;
+
+    const byProvider = new Map();
+    for (const f of pointsFc.features) {
+      const provider = (f.properties && f.properties.provider) || "Coverage";
+      if (!byProvider.has(provider)) byProvider.set(provider, []);
+      byProvider.get(provider).push(f);
+    }
+
+    const polygons = [];
+    for (const [provider, features] of byProvider.entries()) {
+      const sampled = downsampleFeatures(features, 1500);
+      if (sampled.length < 3) continue;
+      const fc = turf.featureCollection(sampled);
+      const bbox = turf.bbox(fc);
+      const diagKm = turf.distance([bbox[0], bbox[1]], [bbox[2], bbox[3]], { units: "kilometers" });
+      const maxEdge = Math.max(0.8, diagKm / 18);
+      let hull = turf.concave(fc, { maxEdge, units: "kilometers" }) || turf.convex(fc);
+      if (!hull) continue;
+
+      const bufferKm = Math.max(0.15, diagKm / 200);
+      try {
+        const expanded = turf.buffer(hull, bufferKm, { units: "kilometers" });
+        const smoothed = turf.buffer(expanded, -bufferKm, { units: "kilometers" });
+        if (smoothed) hull = smoothed;
+      } catch (e) {
+        // If buffer fails, keep the hull as-is.
+      }
+
+      hull.properties = {
+        provider,
+        technology: "Derived",
+        source: "points-derived"
+      };
+      polygons.push(hull);
+    }
+
+    if (!polygons.length) return null;
+    return turf.featureCollection(polygons);
+  }
+
+  loadRegionBundle(activeRegion).then(({ allPoints, available, overlaps, polygons, dataRoot, legacyFallback }) => {
+    dataRootLabel.textContent = legacyFallback
+      ? `Region: ${activeRegionLabel} | Data path: ./ (legacy fallback)`
+      : `Region: ${activeRegionLabel} | Data path: ${dataRoot}/`;
+
+    // --- Polygons ---
+    const hasProvidedPolygons = polygons && polygons.features && polygons.features.length;
+    const hasAvailablePoints = available && available.features && available.features.length;
+    const derivedPolygons = hasAvailablePoints ? buildDerivedPolygons(available) : null;
+    const polygonData = hasProvidedPolygons ? polygons : derivedPolygons;
+
+    const diagnostics = [];
+    if (!hasProvidedPolygons && !derivedPolygons) {
+      diagnostics.push("No polygon features loaded.");
+    }
+    if (!hasAvailablePoints) {
+      diagnostics.push("No available-address features (availability_result is empty).");
+    }
+    if (hasProvidedPolygons && allPoints && allPoints.features && allPoints.features.length && typeof turf !== "undefined") {
+      const p1 = turf.bbox(polygons);
+      const p2 = turf.bbox(allPoints);
+      const disjoint = p1[2] < p2[0] || p1[0] > p2[2] || p1[3] < p2[1] || p1[1] > p2[3];
+      if (disjoint) diagnostics.push("Polygons and points appear to be in different regions.");
+    }
+    if (diagnostics.length) {
+      const div = document.createElement("div");
+      div.style.position = "absolute";
+      div.style.bottom = "10px";
+      div.style.left = "10px";
+      div.style.zIndex = 9999;
+      div.style.background = "#fffbeb";
+      div.style.color = "#92400e";
+      div.style.padding = "8px 10px";
+      div.style.borderRadius = "8px";
+      div.style.fontFamily = "system-ui, sans-serif";
+      div.style.fontSize = "12px";
+      div.style.maxWidth = "380px";
+      div.textContent = diagnostics.join(" ");
+      document.body.appendChild(div);
+    }
+
+    if (polygonData) {
+      L.geoJSON(polygonData, {
+        style: f => ({
+          color: colors[f.properties.provider] || "#555",
+          weight: 2,
+          fillOpacity: 0.25
+        }),
+        onEachFeature: (f, layer) => {
+          layer.bindPopup(
+            `<b>${f.properties.provider}</b><br>${f.properties.technology}`
+          );
+        }
+      }).addTo(layers.polygons);
+    }
+
+    function renderPointsByZoom() {
+      const zoom = map.getZoom();
+      const allFeatures = downsampleFeatures(
+        allPoints && allPoints.features,
+        targetCountByZoom(
+          allPoints && allPoints.features ? allPoints.features.length : 0,
+          zoom,
+          1400,
+          500,
+          5000
+        )
+      );
+      const availableFeatures = downsampleFeatures(
+        available && available.features,
+        targetCountByZoom(
+          available && available.features ? available.features.length : 0,
+          zoom,
+          1800,
+          700,
+          5000
+        )
+      );
+      const overlapFeatures = downsampleFeatures(
+        overlaps && overlaps.features,
+        targetCountByZoom(
+          overlaps && overlaps.features ? overlaps.features.length : 0,
+          zoom,
+          650,
+          200,
+          2500
+        )
+      );
+
+      const allRadius = zoom >= 13 ? 1.8 : zoom >= 11 ? 1.5 : 1.2;
+      const availableRadius = zoom >= 13 ? 2.6 : zoom >= 11 ? 2.2 : 1.8;
+      const overlapRadius = zoom >= 13 ? 4.2 : zoom >= 11 ? 3.5 : 3.0;
+      const jitterMeters = zoom >= 14 ? 6 : zoom >= 12 ? 3 : 0;
+
+      layers.allPoints.clearLayers();
+      layers.available.clearLayers();
+      layers.overlaps.clearLayers();
+
+      L.geoJSON({ type: "FeatureCollection", features: allFeatures || [] }, {
+        pointToLayer: (_, latlng) =>
+          L.circleMarker(latlng, {
+            radius: allRadius,
+            color: "#9ca3af",
+            fillOpacity: 0.18,
+            weight: 0.45
+          })
+      }).addTo(layers.allPoints);
+
+      L.geoJSON({ type: "FeatureCollection", features: availableFeatures || [] }, {
+        pointToLayer: (f, latlng) => {
+          const c = colors[f.properties.provider] || "#374151";
+          const addrId = f.properties && f.properties.address_id;
+          const provider = (f.properties && f.properties.provider) || "Coverage";
+          const jittered = jitterMeters > 0
+            ? jitterLatLng(latlng, `${addrId}:${provider}`, jitterMeters)
+            : latlng;
+          return L.circleMarker(jittered, {
+            radius: availableRadius,
+            color: c,
+            fillColor: c,
+            fillOpacity: zoom >= 13 ? 0.34 : 0.28,
+            weight: 0.7
+          });
+        },
+        onEachFeature: (f, layer) => {
+          layer.bindPopup(
+            `Address ${f.properties.address_id}<br>` +
+            `<b>${f.properties.provider}</b> – ${f.properties.technology}`
+          );
+        }
+      }).addTo(layers.available);
+
+      L.geoJSON({ type: "FeatureCollection", features: overlapFeatures || [] }, {
+        pointToLayer: (f, latlng) =>
+          L.circleMarker(latlng, {
+            radius: overlapRadius,
+            color: "#92400e",
+            fillColor: "#92400e",
+            fillOpacity: 0.0,
+            weight: 1.3,
+            opacity: 0.85
+          }),
+        onEachFeature: (f, layer) => {
+          layer.bindPopup(
+            `Address ${f.properties.address_id}<br>` +
+            `Overlaps: ${f.properties.coverage_count}`
+          );
+        }
+      }).addTo(layers.overlaps);
+    }
+
+    renderPointsByZoom();
+    map.on("zoomend", renderPointsByZoom);
+
+    // Add everything to map
+    layers.polygons.addTo(map);
+    layers.available.addTo(map);
+    // Keep overlaps optional to avoid visually masking availability at initial load.
+
+    L.control.layers(null, {
+      "Coverage polygons": layers.polygons,
+      "All addresses (context)": layers.allPoints,
+      "Available addresses": layers.available,
+      "Overlap / conflict addresses": layers.overlaps
+    }).addTo(map);
+
+    // Fit bounds to available data.
+    // LayerGroup does not always provide getBounds(), so recurse by capability.
+    const bounds = L.latLngBounds([]);
+    const tryExtend = layer => {
+      if (!layer) return;
+
+      if (typeof layer.getBounds === "function") {
+        const b = layer.getBounds();
+        if (b && b.isValid && b.isValid()) bounds.extend(b);
+        return;
+      }
+
+      if (typeof layer.getLatLng === "function") {
+        bounds.extend(layer.getLatLng());
+        return;
+      }
+
+      if (typeof layer.eachLayer === "function") {
+        layer.eachLayer(tryExtend);
+      }
+    };
+
+    tryExtend(layers.available);
+    tryExtend(layers.overlaps);
+    tryExtend(layers.allPoints);
+    tryExtend(layers.polygons);
+    if (bounds.isValid()) map.fitBounds(bounds.pad(0.05));
+
+  }).catch(err => {
+  console.error(err);
+
+  const div = document.createElement("div");
+  div.style.position = "absolute";
+  div.style.top = "10px";
+  div.style.right = "10px";
+  div.style.zIndex = 9999;
+  div.style.background = "#fee2e2";
+  div.style.color = "#7f1d1d";
+  div.style.padding = "8px 12px";
+  div.style.borderRadius = "6px";
+  div.style.fontFamily = "system-ui, sans-serif";
+  div.textContent = `${err.message} Hint: run the generator with --region ${activeRegion} --web-dir ./web/data/${activeRegion}.`;
+
+  document.body.appendChild(div);
+});
+
+</script>
+</body>
+</html>
